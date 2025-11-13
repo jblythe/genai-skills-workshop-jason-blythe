@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+google-cloud-aiplatform
+google-cloud-logging
+vertexai
+langchain
+python-dotenv
+google-auth
+google-auth-transport-requests
+requests
