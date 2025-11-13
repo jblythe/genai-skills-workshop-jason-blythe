@@ -6,5 +6,4 @@ vertexai
 langchain
 python-dotenv
 google-auth
-google-auth-transport-requests
 requests
