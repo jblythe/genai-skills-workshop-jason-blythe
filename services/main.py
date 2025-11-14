@@ -221,7 +221,15 @@ def retrieve_context(query: str, session_id: str) -> Tuple[list[str], list[str]]
             text = "\n".join(
                 f"{key}: {value}" for key, value in document.derived_struct_data.items()
             )
-        source = document.content_uri or document.name
+        candidate_sources = [document.content_uri]
+        if document.struct_data:
+            candidate_sources.extend(document.struct_data.get(key) for key in ("source", "link", "uri"))
+        if document.derived_struct_data:
+            candidate_sources.extend(
+                document.derived_struct_data.get(key) for key in ("source", "link", "uri")
+            )
+        candidate_sources.append(document.name)
+        source = next((value for value in candidate_sources if value), document.name)
         if text:
             context_blocks.append(f"Source: {source}\n{text}")
         sources.append(source)
