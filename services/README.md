@@ -12,14 +12,14 @@ FastAPI backend that powers the Alaska Department of Snow virtual assistant. Pro
 
 - `GOOGLE_CLOUD_PROJECT`: GCP project ID.
 - `VERTEXAI_LOCATION`: Vertex AI region (e.g. `us-central1`).
-- `VERTEX_SEARCH_SERVING_CONFIG`: Fully-qualified Vertex Search serving config returned by `initialize_dialogflow_datastore()` (for example, `projects/<project>/locations/global/collections/default_collection/dataStores/ads-faq-unstructured/servingConfigs/default_serving_config`).
+- `VERTEX_SEARCH_SERVING_CONFIG`: Fully-qualified Vertex Search serving config returned by `initialize_dialogflow_datastore()` (for example, `projects/<project>/locations/global/collections/default_collection/dataStores/ads-faq-unstructured_1763065016419/servingConfigs/default_serving_config`).
 - `MODEL_ARMOR_PROMPT_TEMPLATE`: Prompt template resource created in the notebook (`projects/<project>/locations/<region>/templates/ads-snow-prompt-template`).
 - `MODEL_ARMOR_RESPONSE_TEMPLATE`: Response template resource created in the notebook (`projects/<project>/locations/<region>/templates/ads-snow-response-template`).
 
 > **Tip:** After running the notebook provisioning cells, export the values for reuse:
 >
 > ```bash
-> VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured/servingConfigs/default_serving_config"
+> VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured_1763065016419/servingConfigs/default_serving_config"
 > MODEL_ARMOR_PROMPT_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-prompt-template"
 > MODEL_ARMOR_RESPONSE_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-response-template"
 > ```
@@ -39,7 +39,7 @@ uvicorn main:app --reload
 chmod +x deploy.sh
 export PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8
 export REGION=us-central1
-export VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured/servingConfigs/default_serving_config"
+export VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured_1763065016419/servingConfigs/default_serving_config"
 export MODEL_ARMOR_PROMPT_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-prompt-template"
 export MODEL_ARMOR_RESPONSE_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-response-template"
 ./deploy.sh
@@ -52,7 +52,7 @@ export PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8
 export REGION=us-central1
 export SERVICE=ads-snow-agent-api
 export IMAGE=gcr.io/$PROJECT_ID/$SERVICE:latest
-export VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured/servingConfigs/default_serving_config"
+export VERTEX_SEARCH_SERVING_CONFIG="projects/$PROJECT_ID/locations/global/collections/default_collection/dataStores/ads-faq-unstructured_1763065016419/servingConfigs/default_serving_config"
 export MODEL_ARMOR_PROMPT_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-prompt-template"
 export MODEL_ARMOR_RESPONSE_TEMPLATE="projects/$PROJECT_ID/locations/$REGION/templates/ads-snow-response-template"
 

@@ -8,23 +8,25 @@ Google Model Armor.
 - Every major step is logged to Cloud Logging for observability and auditability.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from dataclasses import dataclass
+from datetime import datetime
 import logging
 import os
 import re
-from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import google.auth
 import requests
 from google.auth.transport.requests import AuthorizedSession, Request
 
-from google.cloud import logging_v2
 from google.cloud import discoveryengine_v1
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from google.cloud import logging_v2
 import vertexai
+from vertexai.generative_models import GenerationConfig, GenerativeModel
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -45,7 +47,34 @@ SENSITIVE_PATTERNS = {
     "pii_email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
     "pii_phone": re.compile(r"(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"),
 }
-ALLOWED_TOPICS = ["snow", "plow", "parking", "permit"]
+
+DEFAULT_CONTEXT = (
+    "You are the official Alaska Department of Snow (ADS) virtual assistant. "
+    "Provide concise, policy-compliant answers to residents about snow removal operations, "
+    "parking rules during snow emergencies, street maintenance status, and ADS contact channels. "
+    "Only answer when confident. If the question cannot be answered with ADS guidance, admit the gap "
+    "and recommend contacting ADS directly."
+)
+
+ADS_KEYWORDS = {
+    "snow",
+    "plow",
+    "plowing",
+    "parking",
+    "permit",
+    "storm",
+    "winter",
+    "ice",
+    "sidewalk",
+    "driveway",
+    "ads",
+    "alaska",
+    "department of snow",
+    "road",
+    "closure",
+    "schedule",
+    "emergency",
+}
 
 
 def _resolve_serving_config() -> str:
@@ -111,17 +140,122 @@ def log_event(event: str, session_id: str, severity: str = "INFO", **fields) -> 
 
 
 # ---------------------------------------------------------------------------
-# External clients (Vertex AI Search + Generative Model)
+# Agent configuration helpers (adapted from lab_1_baking_agent workflow)
 # ---------------------------------------------------------------------------
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-model = GenerativeModel(MODEL_NAME)
+
+
+@dataclass
+class ModelArmorTemplateConfig:
+    """Model Armor template identifiers used for sanitisation."""
+
+    prompt_template: str
+    response_template: Optional[str] = None
+
+
+@dataclass
+class AgentSettings:
+    """Settings required to initialise the ADS virtual assistant."""
+
+    vertex_project_id: str
+    vertex_location: str
+    model_name: str
+    base_context: str = DEFAULT_CONTEXT
+    model_armor_prompt_template: Optional[str] = None
+    model_armor_response_template: Optional[str] = None
+
+
+def validate_user_question(question: str) -> Tuple[bool, Optional[str]]:
+    """Return whether the user question is in-scope for the ADS assistant."""
+
+    normalised = question.lower()
+    if any(keyword in normalised for keyword in ADS_KEYWORDS):
+        return True, None
+    return (
+        False,
+        "I can help with Alaska Department of Snow policies, operations, and resident guidance.",
+    )
+
+
+def build_context(additional_context: str = "") -> str:
+    """Combine the base ADS context with optional additional instructions."""
+
+    segments = [DEFAULT_CONTEXT]
+    if additional_context.strip():
+        segments.append(additional_context.strip())
+    return "\n\n".join(segments)
+
+
+def augment_user_query(question: str, context: str) -> str:
+    """Construct the prompt sent to the model with baked-in instructions."""
+
+    return f"{context}\n\nResident question: {question.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# Retrieval helpers
+# ---------------------------------------------------------------------------
 search_client = discoveryengine_v1.SearchServiceClient()
 
-try:
-    backend_config = (requests.get(f"{os.environ.get('VERTEX_SEARCH_SERVING_CONFIG_BASE', '')}/config.js").text if False else None)  # placeholder for runtime fetch if needed
-except Exception:  # pragma: no cover - best effort logging
-    backend_config = None
-logging.getLogger("ads_snow_agent").info("Backend configured with serving config %s", SERVING_CONFIG_NAME)
+
+def retrieve_context(query: str, session_id: str) -> Tuple[list[str], list[str]]:
+    """Query Vertex AI Search for supporting context."""
+
+    search_request = discoveryengine_v1.SearchRequest(
+        serving_config=SERVING_CONFIG_NAME,
+        query=query,
+        page_size=6,
+        query_expansion_spec=discoveryengine_v1.SearchRequest.QueryExpansionSpec(
+            condition=discoveryengine_v1.SearchRequest.QueryExpansionSpec.Condition.DISABLED
+        ),
+    )
+    search_results = search_client.search(request=search_request)
+
+    context_blocks: list[str] = []
+    sources: list[str] = []
+    for result in search_results:
+        document = result.document
+        text = (document.content or "").strip()
+        if not text and document.struct_data:
+            text = "\n".join(f"{key}: {value}" for key, value in document.struct_data.items())
+        if not text and document.derived_struct_data:
+            text = "\n".join(
+                f"{key}: {value}" for key, value in document.derived_struct_data.items()
+            )
+        source = document.content_uri or document.name
+        if text:
+            context_blocks.append(f"Source: {source}\n{text}")
+        sources.append(source)
+
+    log_event("retrieval_completed", session_id, neighbors=len(context_blocks), sources=sources)
+    return context_blocks, sources
+
+
+# ---------------------------------------------------------------------------
+# Vertex chat client (adapted from lab_1_baking_agent)
+# ---------------------------------------------------------------------------
+
+
+class VertexChatClient:
+    """Wrapper around Vertex AI GenerativeModel."""
+
+    def __init__(self, project: str, location: str, model_name: str):
+        try:
+            vertexai.init(project=project, location=location)
+        except Exception as exc:  # pragma: no cover - env specific
+            raise RuntimeError("Vertex AI initialization failed") from exc
+        self.model = GenerativeModel(model_name)
+        self.generation_config = GenerationConfig(temperature=0.2, max_output_tokens=512)
+
+    def generate(self, prompt: str) -> str:
+        try:
+            response = self.model.generate_content(prompt, generation_config=self.generation_config)
+        except Exception as exc:  # pragma: no cover - upstream SDK errors vary
+            raise RuntimeError("Vertex chat generation failed") from exc
+
+        if not response or not getattr(response, "text", None):
+            raise RuntimeError("Vertex chat returned an empty response")
+
+        return response.text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -131,22 +265,28 @@ class PromptSafetyError(Exception):
     """Raised when heuristic safety rules reject user prompts or model output."""
 
 
-class ModelArmorError(Exception):
-    """Raised when Model Armor encounters an operational issue."""
-
-
 class SafetyViolationError(Exception):
     """Raised when Model Armor blocks content."""
 
+class SafetyCheckError(Exception):
+    """Raised when Model Armor cannot perform the requested check."""
+
 
 # ---------------------------------------------------------------------------
-# Model Armor integration
+# Model Armor integration (aligned with lab_1_baking_agent)
 # ---------------------------------------------------------------------------
-def _create_authorized_session() -> AuthorizedSession:
-    """Return an authorised session used for Model Armor REST calls."""
-    credentials, _ = google.auth.default(scopes=_MODEL_ARMOR_SCOPES)
-    credentials.refresh(Request())
-    return AuthorizedSession(credentials)
+_AUTHORIZED_SESSION: Optional[AuthorizedSession] = None
+
+
+def get_authorized_session() -> AuthorizedSession:
+    """Return a cached AuthorizedSession for Model Armor API calls."""
+
+    global _AUTHORIZED_SESSION
+    if _AUTHORIZED_SESSION is None:
+        credentials, _ = google.auth.default(scopes=_MODEL_ARMOR_SCOPES)
+        credentials.refresh(Request())
+        _AUTHORIZED_SESSION = AuthorizedSession(credentials)
+    return _AUTHORIZED_SESSION
 
 
 def _is_blocked(model_armor_result: dict) -> bool:
@@ -186,123 +326,89 @@ def _is_blocked(model_armor_result: dict) -> bool:
 
 
 class ModelArmorClient:
-    """Convenience wrapper around Model Armor prompt/response sanitisation APIs."""
+    """Wrapper around Model Armor REST endpoints using template resources."""
 
-    def __init__(self, prompt_template: str, response_template: Optional[str] = None):
-        """Initialise the client.
+    def __init__(self, config: ModelArmorTemplateConfig):
+        self.config = config
+        self.session = get_authorized_session()
 
-        Parameters
-        ----------
-        prompt_template
-            Fully-qualified Model Armor template resource used to sanitise prompts.
-        response_template
-            Optional template resource for sanitising model responses. Defaults to
-            `prompt_template` when omitted.
-        """
-
-        if not prompt_template:
-            raise ValueError("Model Armor prompt template is required")
-        self.prompt_template = prompt_template
-        self.response_template = response_template or prompt_template
-        self.session = _create_authorized_session()
-
-    def sanitize_prompt(self, prompt: str, session_id: str) -> str:
-        """Sanitise the user prompt using Model Armor templates.
-
-        Parameters
-        ----------
-        prompt
-            User prompt (or constructed prompt including context) to sanitise.
-        session_id
-            Identifier for the current chat session, used to annotate logs.
-        """
-
-        endpoint = f"{MODEL_ARMOR_API_BASE}/{self.prompt_template}:sanitizeUserPrompt"
+    def sanitize_prompt(self, prompt: str, session_id: Optional[str] = None) -> str:
+        endpoint = f"{MODEL_ARMOR_API_BASE}/{self.config.prompt_template}:sanitizeUserPrompt"
         payload = {"userPromptData": {"text": prompt}}
         try:
             response = self.session.post(endpoint, json=payload, timeout=20)
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise ModelArmorError("Model Armor prompt sanitization failed") from exc
+            raise SafetyCheckError("Model Armor prompt sanitization failed") from exc
 
         result = response.json()
         if _is_blocked(result):
             raise SafetyViolationError("Model Armor blocked the prompt")
 
-        sanitized = (
-            result.get("sanitizationResult", {}).get("sanitizedText")
-            or result.get("sanitizedPrompt", {}).get("text")
-            if isinstance(result.get("sanitizedPrompt"), dict)
-            else None
-        )
-        log_event("prompt_sanitized", session_id, sanitized=bool(sanitized))
-        return sanitized or prompt
+        sanitized = result.get("sanitizationResult", {}).get("sanitizedText") or prompt
+        if session_id:
+            log_event(
+                "prompt_sanitized",
+                session_id,
+                sanitized=bool(sanitized and sanitized != prompt),
+            )
+        return sanitized
 
-    def sanitize_response(self, response_text: str, session_id: str) -> str:
-        """Sanitise the model response prior to returning it to the caller.
-
-        Parameters
-        ----------
-        response_text
-            The generated answer from the LLM.
-        session_id
-            Identifier for the current chat session, used to annotate logs.
-        """
-
-        endpoint = f"{MODEL_ARMOR_API_BASE}/{self.response_template}:sanitizeModelResponse"
+    def sanitize_response(self, response_text: str, session_id: Optional[str] = None) -> str:
+        endpoint = f"{MODEL_ARMOR_API_BASE}/{self.config.response_template}:sanitizeModelResponse"
         payload = {"modelResponseData": {"text": response_text}}
         try:
             response = self.session.post(endpoint, json=payload, timeout=20)
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise ModelArmorError("Model Armor response sanitization failed") from exc
+            raise SafetyCheckError("Model Armor response sanitization failed") from exc
 
         result = response.json()
         if _is_blocked(result):
             raise SafetyViolationError("Model Armor blocked the response")
 
-        sanitized = (
-            result.get("sanitizationResult", {}).get("sanitizedText")
-            or result.get("sanitizedResponse", {}).get("text")
-            if isinstance(result.get("sanitizedResponse"), dict)
-            else None
-        )
-        log_event("response_sanitized", session_id, sanitized=bool(sanitized))
-        return sanitized or response_text
+        sanitized = result.get("sanitizationResult", {}).get("sanitizedText") or response_text
+        if session_id:
+            log_event(
+                "response_sanitized",
+                session_id,
+                sanitized=bool(sanitized and sanitized != response_text),
+            )
+        return sanitized
 
 
 armor_client: Optional[ModelArmorClient] = None
 if MODEL_ARMOR_PROMPT_TEMPLATE:
     try:
-        armor_client = ModelArmorClient(
+        armor_config = ModelArmorTemplateConfig(
             prompt_template=MODEL_ARMOR_PROMPT_TEMPLATE,
             response_template=MODEL_ARMOR_RESPONSE_TEMPLATE,
         )
-    except Exception as exc:  # pragma: no cover - fallback allows service to run without armor
-        logging.getLogger("ads_snow_agent").warning("Model Armor initialization failed: %s", exc)
+        armor_client = ModelArmorClient(config=armor_config)
+    except Exception as exc:  # pragma: no cover - allow service to run without armor
+        logging.getLogger("ads_snow_agent").warning("Model Armor init failed: %s", exc)
         armor_client = None
+
+
+agent_settings = AgentSettings(
+    vertex_project_id=PROJECT_ID,
+    vertex_location=LOCATION,
+    model_name=MODEL_NAME,
+    base_context=DEFAULT_CONTEXT,
+    model_armor_prompt_template=MODEL_ARMOR_PROMPT_TEMPLATE,
+    model_armor_response_template=MODEL_ARMOR_RESPONSE_TEMPLATE,
+)
+
+chat_client = VertexChatClient(
+    project=agent_settings.vertex_project_id,
+    location=agent_settings.vertex_location,
+    model_name=agent_settings.model_name,
+)
 
 
 # ---------------------------------------------------------------------------
 # Heuristic validation helpers
 # ---------------------------------------------------------------------------
-def validate_prompt(message: str) -> None:
-    """Reject prompts containing disallowed topics or obvious sensitive data.
-
-    Parameters
-    ----------
-    message
-        User-supplied prompt text.
-    """
-
-    lower_msg = message.lower()
-    if not any(topic in lower_msg for topic in ALLOWED_TOPICS):
-        raise PromptSafetyError("Unsupported topic for ADS agent")
-    for label, pattern in SENSITIVE_PATTERNS.items():
-        if pattern.search(message):
-            raise PromptSafetyError(f"Sensitive data detected: {label}")
-
-
 def validate_response(answer: str) -> None:
     """Perform post-generation checks to ensure the answer is policy-compliant.
 
@@ -314,7 +420,7 @@ def validate_response(answer: str) -> None:
 
     for label, pattern in SENSITIVE_PATTERNS.items():
         if pattern.search(answer):
-            raise PromptSafetyError(f"Sensitive data detected in response: {label}")
+            raise PromptSafetyError(f"ADS safety policy violation detected: {label}")
 
 
 # ---------------------------------------------------------------------------
@@ -374,57 +480,32 @@ def chat_request(request: ChatRequest):
     log_event("chat_received", session_id, prompt=user_message)
 
     try:
-        # Validate and optionally sanitise the user prompt
-        validate_prompt(user_message)
+        is_valid, violation_message = validate_user_question(user_message)
+        if not is_valid:
+            raise PromptSafetyError(violation_message or "Out-of-domain request")
         log_event("prompt_validated", session_id)
 
-        sanitized_prompt = user_message
-        if armor_client:
-            sanitized_prompt = armor_client.sanitize_prompt(user_message, session_id=session_id)
+        base_context = build_context(agent_settings.base_context)
+        augmented_prompt = augment_user_query(user_message, base_context)
 
-        # Retrieve relevant documents from Vertex AI Search
-        search_request = discoveryengine_v1.SearchRequest(
-            serving_config=SERVING_CONFIG_NAME,
-            query=sanitized_prompt,
-            page_size=6,
-            query_expansion_spec=discoveryengine_v1.SearchRequest.QueryExpansionSpec(
-                condition=discoveryengine_v1.SearchRequest.QueryExpansionSpec.Condition.DISABLED
-            ),
-        )
-        search_results = search_client.search(request=search_request)
-        context_blocks = []
-        sources = []
-        for result in search_results:
-            document = result.document
-            text = (document.content or "").strip()
-            if not text and document.struct_data:
-                text = "\n".join(f"{k}: {v}" for k, v in document.struct_data.items())
-            if not text and document.derived_struct_data:
-                text = "\n".join(f"{k}: {v}" for k, v in document.derived_struct_data.items())
-            source = document.content_uri or document.name
-            context_blocks.append(f"Source: {source}\n{text}")
-            sources.append(source)
-        log_event("retrieval_completed", session_id, neighbors=len(context_blocks), sources=sources)
-
-        # Assemble prompt and generate
-        prompt = sanitized_prompt
+        context_blocks, sources = retrieve_context(user_message, session_id)
         if context_blocks:
-            prompt = sanitized_prompt + "\n\nContext:\n" + "\n\n".join(context_blocks)
-        if armor_client:
-            prompt = armor_client.sanitize_prompt(prompt, session_id=session_id)
+            augmented_prompt = (
+                f"{augmented_prompt}\n\nADS reference material:\n" + "\n\n".join(context_blocks)
+            )
 
-        response = model.generate_content(
-            [prompt],
-            generation_config=GenerationConfig(temperature=0.2, max_output_tokens=512),
-        )
-        answer = response.text
+        safe_prompt = augmented_prompt
+        if armor_client:
+            safe_prompt = armor_client.sanitize_prompt(augmented_prompt, session_id=session_id)
+
+        answer = chat_client.generate(safe_prompt)
         log_event("generation_completed", session_id)
 
-        # Post-generation safety checks
         if armor_client:
             answer = armor_client.sanitize_response(answer, session_id=session_id)
+
         validate_response(answer)
-        log_event("safety_checks_passed", session_id)
+        log_event("safety_checks_passed", session_id, sources=sources)
 
         log_event("chat_completed", session_id, answer=answer, sources=sources)
         return ChatResponse(answer=answer, sources=sources)
@@ -432,7 +513,7 @@ def chat_request(request: ChatRequest):
     except SafetyViolationError as unsafe:
         log_event("model_armor_block", session_id, severity="WARNING", detail=str(unsafe))
         raise HTTPException(status_code=422, detail="Prompt blocked by safety system") from unsafe
-    except ModelArmorError as armor_error:
+    except SafetyCheckError as armor_error:
         log_event("model_armor_error", session_id, severity="ERROR", detail=str(armor_error))
         raise HTTPException(status_code=500, detail="Safety system error") from armor_error
     except PromptSafetyError as unsafe:
