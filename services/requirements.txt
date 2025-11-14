@@ -7,3 +7,4 @@ langchain
 python-dotenv
 google-auth
 requests
+google-cloud-discoveryengine

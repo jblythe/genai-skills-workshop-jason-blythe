@@ -27,32 +27,29 @@ npm run build
 
 ```bash
 chmod +x deploy.sh
-PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8 \
-REGION=us-central1 \
-VITE_API_URL=https://ads-snow-agent-api-<your-suffix>-uc.a.run.app \
-./deploy.sh
+export PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8
+export REGION=us-central1
+export VITE_API_URL=https://ads-snow-agent-api-i2pzc23xkq-uc.a.run.app
+./deploy.sh  # builds with VITE_API_URL and sets it as a runtime env var
 ```
 
 Or run the commands manually:
 
 ```bash
-PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8
-REGION=us-central1
-SERVICE=ads-agent-web
-IMAGE=gcr.io/$PROJECT_ID/$SERVICE:latest
-API_URL=https://ads-snow-agent-api-<your-suffix>-uc.a.run.app
+export PROJECT_ID=qwiklabs-gcp-04-ee8165cd97c8
+export REGION=us-central1
+export SERVICE=ads-agent-web
+export IMAGE=gcr.io/$PROJECT_ID/$SERVICE:latest
+export API_URL=https://ads-snow-agent-api-i2pzc23xkq-uc.a.run.app
 
-# Build container (Mac/Apple Silicon users should target linux/amd64)
-docker buildx build --platform=linux/amd64 \
-  --build-arg VITE_API_URL=$API_URL \
-  -t $IMAGE web
-# or use Cloud Build:
-# gcloud builds submit web --tag $IMAGE --build-arg VITE_API_URL=$API_URL
+gcloud builds submit web \
+  --config web/cloudbuild.yaml \
+  --substitutions _IMAGE=$IMAGE,_VITE_API_URL=$API_URL
 
-# Deploy container
 gcloud run deploy $SERVICE \
   --image $IMAGE \
   --region $REGION \
   --platform managed \
-  --allow-unauthenticated
+  --allow-unauthenticated \
+  --set-env-vars VITE_API_URL=$API_URL
 ```

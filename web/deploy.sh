@@ -34,10 +34,11 @@ if [[ -z "${VITE_API_URL}" ]]; then
   exit 1
 fi
 
-echo "Building frontend container: ${IMAGE}" >&2
+echo "Building frontend container via Cloud Build: ${IMAGE}" >&2
 gcloud builds submit --project "${PROJECT_ID}" \
-  --tag "${IMAGE}" \
-  --substitutions _VITE_API_URL="${VITE_API_URL}" .
+  --config cloudbuild.yaml \
+  --substitutions _IMAGE="${IMAGE}",_VITE_API_URL="${VITE_API_URL}" \
+  .
 
 echo "Deploying Cloud Run service: ${SERVICE_NAME}" >&2
 
@@ -46,4 +47,5 @@ gcloud run deploy "${SERVICE_NAME}" \
   --image "${IMAGE}" \
   --region "${REGION}" \
   --platform managed \
-  --allow-unauthenticated
+  --allow-unauthenticated \
+  --set-env-vars VITE_API_URL="${VITE_API_URL}"

@@ -3,7 +3,7 @@
 The service exposes a `/chat` endpoint that orchestrates retrieval-augmented generation
 (RAG) using Vertex AI Gemini with safety gates provided by custom heuristics and
 Google Model Armor.
-- Retrieval is backed by a Matching Engine index (Vertex AI Vector Search).
+- Retrieval is backed by Vertex AI Search (Dialogflow Data Store).
 - Prompt/response sanitisation leverages Model Armor templates when configured.
 - Every major step is logged to Cloud Logging for observability and auditability.
 """
@@ -22,16 +22,16 @@ import requests
 from google.auth.transport.requests import AuthorizedSession, Request
 
 from google.cloud import logging_v2
+from google.cloud import discoveryengine_v1
 from vertexai.generative_models import GenerativeModel, GenerationConfig
-from google.cloud import aiplatform
+import vertexai
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.environ.get("VERTEXAI_LOCATION", "us-central1")
-INDEX_ENDPOINT_ID = os.environ.get("VERTEX_MATCHING_ENGINE_ENDPOINT_ID")
-INDEX_ENDPOINT_NAME_ENV = os.environ.get("VERTEX_MATCHING_ENGINE_ENDPOINT")
+SEARCH_SERVING_CONFIG = os.environ.get("VERTEX_SEARCH_SERVING_CONFIG")
 MODEL_NAME = os.environ.get("GENAI_MODEL", "gemini-2.5-flash-lite")
 MODEL_ARMOR_PROMPT_TEMPLATE = os.environ.get("MODEL_ARMOR_PROMPT_TEMPLATE")
 MODEL_ARMOR_RESPONSE_TEMPLATE = os.environ.get(
@@ -48,29 +48,26 @@ SENSITIVE_PATTERNS = {
 ALLOWED_TOPICS = ["snow", "plow", "parking", "permit"]
 
 
-def _resolve_matching_engine_endpoint() -> str:
-    """Return the fully-qualified Matching Engine endpoint path.
-
-    Prefers the bare endpoint ID (`VERTEX_MATCHING_ENGINE_ENDPOINT_ID`) when set,
-    falling back to a legacy fully-qualified value (`VERTEX_MATCHING_ENGINE_ENDPOINT`).
-    """
-
-    candidate = INDEX_ENDPOINT_ID or INDEX_ENDPOINT_NAME_ENV
-    if not candidate:
+def _resolve_serving_config() -> str:
+    """Return the fully-qualified Vertex Search serving config path."""
+    if not SEARCH_SERVING_CONFIG:
         raise RuntimeError(
-            "Matching Engine endpoint not configured. Set VERTEX_MATCHING_ENGINE_ENDPOINT_ID"
-            " or VERTEX_MATCHING_ENGINE_ENDPOINT."
+            "Vertex Search serving config not configured. Set VERTEX_SEARCH_SERVING_CONFIG to the path "
+            "returned by initialize_dialogflow_datastore()."
         )
-    if "/" in candidate:
-        return candidate
+    if "/" in SEARCH_SERVING_CONFIG:
+        return SEARCH_SERVING_CONFIG
     if not PROJECT_ID or not LOCATION:
         raise RuntimeError(
-            "Cannot resolve Matching Engine endpoint ID without GOOGLE_CLOUD_PROJECT and VERTEXAI_LOCATION."
+            "Cannot resolve Vertex Search serving config without GOOGLE_CLOUD_PROJECT and VERTEXAI_LOCATION."
         )
-    return f"projects/{PROJECT_ID}/locations/{LOCATION}/indexEndpoints/{candidate}"
+    return (
+        f"projects/{PROJECT_ID}/locations/global/collections/default_collection/"
+        f"dataStores/{SEARCH_SERVING_CONFIG}/servingConfigs/default_serving_config"
+    )
 
 
-MATCHING_ENGINE_ENDPOINT_NAME = _resolve_matching_engine_endpoint()
+SERVING_CONFIG_NAME = _resolve_serving_config()
 
 # ---------------------------------------------------------------------------
 # FastAPI setup & logging
@@ -114,11 +111,17 @@ def log_event(event: str, session_id: str, severity: str = "INFO", **fields) -> 
 
 
 # ---------------------------------------------------------------------------
-# External clients (Vertex AI + Matching Engine)
+# External clients (Vertex AI Search + Generative Model)
 # ---------------------------------------------------------------------------
-aiplatform.init(project=PROJECT_ID, location=LOCATION)
+vertexai.init(project=PROJECT_ID, location=LOCATION)
 model = GenerativeModel(MODEL_NAME)
-endpoint = aiplatform.MatchingEngineIndexEndpoint(MATCHING_ENGINE_ENDPOINT_NAME)
+search_client = discoveryengine_v1.SearchServiceClient()
+
+try:
+    backend_config = (requests.get(f"{os.environ.get('VERTEX_SEARCH_SERVING_CONFIG_BASE', '')}/config.js").text if False else None)  # placeholder for runtime fetch if needed
+except Exception:  # pragma: no cover - best effort logging
+    backend_config = None
+logging.getLogger("ads_snow_agent").info("Backend configured with serving config %s", SERVING_CONFIG_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +353,14 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
+@app.get("/health")
+def health_check():
     """Liveness probe endpoint."""
     return {"status": "ok"}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+def chat_request(request: ChatRequest):
     """Handle an interactive chat turn from the frontend.
 
     Parameters
@@ -365,9 +368,6 @@ def chat(request: ChatRequest):
     request
         Pydantic model containing the user session identifier and message.
     """
-
-    if not INDEX_ENDPOINT_NAME_ENV:
-        raise HTTPException(status_code=500, detail="Matching Engine endpoint not configured")
 
     session_id = request.session_id
     user_message = request.message
@@ -382,24 +382,34 @@ def chat(request: ChatRequest):
         if armor_client:
             sanitized_prompt = armor_client.sanitize_prompt(user_message, session_id=session_id)
 
-        # Retrieve relevant neighbours from Matching Engine
-        neighbors = endpoint.match(
-            deployed_index_id=endpoint.deployed_indexes[0].id,
-            queries=[sanitized_prompt],
-            num_neighbors=6,
-        )[0]
+        # Retrieve relevant documents from Vertex AI Search
+        search_request = discoveryengine_v1.SearchRequest(
+            serving_config=SERVING_CONFIG_NAME,
+            query=sanitized_prompt,
+            page_size=6,
+            query_expansion_spec=discoveryengine_v1.SearchRequest.QueryExpansionSpec(
+                condition=discoveryengine_v1.SearchRequest.QueryExpansionSpec.Condition.DISABLED
+            ),
+        )
+        search_results = search_client.search(request=search_request)
         context_blocks = []
         sources = []
-        for neighbor in neighbors:
-            meta = neighbor.metadata or {}
-            text = meta.get("text", "")
-            source = meta.get("source", "unknown")
+        for result in search_results:
+            document = result.document
+            text = (document.content or "").strip()
+            if not text and document.struct_data:
+                text = "\n".join(f"{k}: {v}" for k, v in document.struct_data.items())
+            if not text and document.derived_struct_data:
+                text = "\n".join(f"{k}: {v}" for k, v in document.derived_struct_data.items())
+            source = document.content_uri or document.name
             context_blocks.append(f"Source: {source}\n{text}")
             sources.append(source)
-        log_event("retrieval_completed", session_id, neighbors=len(neighbors), sources=sources)
+        log_event("retrieval_completed", session_id, neighbors=len(context_blocks), sources=sources)
 
         # Assemble prompt and generate
-        prompt = sanitized_prompt + "\n\nContext:\n" + "\n\n".join(context_blocks)
+        prompt = sanitized_prompt
+        if context_blocks:
+            prompt = sanitized_prompt + "\n\nContext:\n" + "\n\n".join(context_blocks)
         if armor_client:
             prompt = armor_client.sanitize_prompt(prompt, session_id=session_id)
 

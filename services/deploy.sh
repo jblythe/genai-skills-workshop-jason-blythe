@@ -3,11 +3,11 @@
 #
 # Requirements:
 #   - gcloud CLI authenticated for the target project
-#   - Matching Engine endpoint already provisioned via the notebook
+#   - Vertex AI Search data store (Dialogflow data store) provisioned via the notebook
 #   - (Optional) Model Armor templates created via the notebook
 #
 # Usage:
-#   PROJECT_ID=... REGION=... MATCHING_ENGINE_ENDPOINT_ID=... ./deploy.sh
+#   PROJECT_ID=... REGION=... VERTEX_SEARCH_SERVING_CONFIG=... ./deploy.sh
 #
 # Optional overrides:
 #   SERVICE_NAME (default: ads-snow-agent-api)
@@ -25,7 +25,7 @@ PROJECT_ID=${PROJECT_ID:-}
 REGION=${REGION:-us-central1}
 SERVICE_NAME=${SERVICE_NAME:-ads-snow-agent-api}
 IMAGE=${IMAGE:-gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest}
-MATCHING_ENGINE_ENDPOINT_ID=${MATCHING_ENGINE_ENDPOINT_ID:-}
+VERTEX_SEARCH_SERVING_CONFIG=${VERTEX_SEARCH_SERVING_CONFIG:-}
 MODEL_ARMOR_PROMPT_TEMPLATE=${MODEL_ARMOR_PROMPT_TEMPLATE:-}
 MODEL_ARMOR_RESPONSE_TEMPLATE=${MODEL_ARMOR_RESPONSE_TEMPLATE:-${MODEL_ARMOR_PROMPT_TEMPLATE}}
 
@@ -34,8 +34,8 @@ if [[ -z "${PROJECT_ID}" ]]; then
   exit 1
 fi
 
-if [[ -z "${MATCHING_ENGINE_ENDPOINT_ID}" ]]; then
-  echo "MATCHING_ENGINE_ENDPOINT_ID is required" >&2
+if [[ -z "${VERTEX_SEARCH_SERVING_CONFIG}" ]]; then
+  echo "VERTEX_SEARCH_SERVING_CONFIG is required" >&2
   exit 1
 fi
 
@@ -45,7 +45,7 @@ gcloud builds submit --project "${PROJECT_ID}" --tag "${IMAGE}" .
 env_args=(
   "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
   "VERTEXAI_LOCATION=${REGION}"
-  "VERTEX_MATCHING_ENGINE_ENDPOINT_ID=${MATCHING_ENGINE_ENDPOINT_ID}"
+  "VERTEX_SEARCH_SERVING_CONFIG=${VERTEX_SEARCH_SERVING_CONFIG}"
 )
 
 if [[ -n "${MODEL_ARMOR_PROMPT_TEMPLATE}" ]]; then

@@ -1,0 +1,14 @@
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "build",
+        "--platform=linux/amd64",
+        "--build-arg",
+        "VITE_API_URL=${_VITE_API_URL}",
+        "-t",
+        "${_IMAGE}",
+        ".",
+      ]
+images:
+  - "${_IMAGE}"

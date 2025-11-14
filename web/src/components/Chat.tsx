@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type MessageRole = "user" | "assistant" | "system";
 
@@ -13,7 +13,7 @@ interface ChatResponse {
   sources: string[];
 }
 
-const API_URL = import.meta.env.VITE_API_URL;
+const API_BASE = "https://ads-snow-agent-api-i2pzc23xkq-uc.a.run.app";
 
 export function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -22,6 +22,10 @@ export function Chat() {
   const [error, setError] = useState<string | null>(null);
 
   const disabled = useMemo(() => loading || !input.trim(), [loading, input]);
+
+  useEffect(() => {
+    console.info("[ADS] Backend API URL:", API_BASE);
+  }, []);
 
   async function sendMessage(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -37,7 +41,7 @@ export function Chat() {
     setLoading(true);
 
     try {
-      const response = await fetch(`${API_URL}/chat`, {
+      const response = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: userMessage.id, message: userMessage.text }),
